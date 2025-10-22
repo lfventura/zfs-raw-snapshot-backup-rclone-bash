@@ -217,7 +217,9 @@ handle_error() {
     
     # Check if the error is not error 1 (grep) or 0 (success)
     if [ "$EXIT_CODE" -ne 0 ]; then
-        local MENSAGEM_ERRO="Script failed at line $LINHA_ERRO. EXIT STATUS: $EXIT_CODE."
+        # Build detailed error message with operation context
+        local OPERATION_CONTEXT="${CURRENT_OPERATION:-"unknown operation"}"
+        local MENSAGEM_ERRO="Script failed at line $LINHA_ERRO during: $OPERATION_CONTEXT. EXIT STATUS: $EXIT_CODE."
         
         echo "ERROR DETECTED: $MENSAGEM_ERRO"
 
@@ -249,6 +251,9 @@ set -eo pipefail
 # Arguments: $1 = snapshot name (e.g., "pool/dataset@snapshot" or "pool@snapshot")
 calculate_chunk_size() {
     local snapshot_name="$1"
+    
+    # Set operation context for error handling
+    export CURRENT_OPERATION="calculating chunk size for snapshot $snapshot_name"
     
     echo "Calculating optimal chunk size for snapshot: $snapshot_name"
     
@@ -462,6 +467,14 @@ filter_datasets() {
 aplicar_politica_retencao() {
     local RETENTION_TARGET=$1
     local DATASET_PATTERN=$2
+    
+    # Set operation context for error handling
+    if [ -n "$DATASET_PATTERN" ]; then
+        export CURRENT_OPERATION="applying retention policy for dataset $DATASET_PATTERN (keep $RETENTION_TARGET backups)"
+    else
+        export CURRENT_OPERATION="applying retention policy for $BACKUP_MODE mode (keep $RETENTION_TARGET backups)"
+    fi
+    
     echo "Applying retention policy: keep the $RETENTION_BACKUP_FILE_MAX most recent backups..."
 
     # 1. List all existing backups in S3 based on backup mode
@@ -546,6 +559,8 @@ if [[ "$RETENTION_BACKUP_FILE_MAX" -lt 0 ]]; then
 fi
 
 # --- CONFIGURATION VALIDATIONS ---
+# Set operation context for error handling
+export CURRENT_OPERATION="validating script configuration"
 echo "--- VALIDATING CONFIGURATIONS ---"
 
 # Validation 1: Check if BACKUP_MODE has valid value
@@ -619,6 +634,8 @@ fi
 echo "✓ All configurations are valid."
 
 echo "--- BACKUP START ---"
+# Set operation context for error handling
+export CURRENT_OPERATION="initializing $BACKUP_MODE backup execution"
 echo "Backup mode: $BACKUP_MODE"
 echo "Filter: $FILTER_TYPE"
 if [ -n "$FILTER_LIST" ]; then
@@ -631,6 +648,8 @@ case "$BACKUP_MODE" in
         
         # --- 1. CREATE LOCAL SNAPSHOT ---
         echo "--- 1. Creating Snapshot: ${SNAPSHOT_ID} ---"
+        # Set operation context for error handling
+        export CURRENT_OPERATION="creating snapshot ${SNAPSHOT_ID}"
         sudo zfs snapshot -r "${SNAPSHOT_ID}"
 
         # --- 2. PRE-DELETION LOGIC (PRE_DELETE) ---
@@ -649,6 +668,8 @@ case "$BACKUP_MODE" in
         # Complete pool backup (FULL mode always uses FILTER_TYPE="NONE")
         # If this fails, the trap will handle the error automatically
         echo "Using dynamic chunk size: $DYNAMIC_CHUNK_SIZE"
+        # Set operation context for error handling
+        export CURRENT_OPERATION="uploading FULL backup to S3 (${ARQUIVO_ATUAL_FULL})"
         sudo zfs send -Rwv "${SNAPSHOT_ID}" | \
             sudo "${RCLONE_BIN}" rcat --s3-chunk-size="$DYNAMIC_CHUNK_SIZE" "${S3_REMOTE}":"${S3_BUCKET_PATH}"/"${ARQUIVO_ATUAL_FULL}"
 
@@ -662,7 +683,9 @@ case "$BACKUP_MODE" in
 
         # --- 5. Local Cleanup ---
         echo "--- 5. Destroying Temporary Local Snapshot ---"
-        sudo zfs destroy "${SNAPSHOT_ID}"
+        # Set operation context for error handling
+        export CURRENT_OPERATION="destroying temporary local snapshot ${SNAPSHOT_ID}"
+        sudo zfs destroy -r "${SNAPSHOT_ID}"
         ;;
         
     "SPLIT")
@@ -683,6 +706,8 @@ case "$BACKUP_MODE" in
         
         # Create snapshot of all datasets
         echo "--- 2. Creating Snapshot: ${SNAPSHOT_ID} ---"
+        # Set operation context for error handling
+        export CURRENT_OPERATION="creating snapshot ${SNAPSHOT_ID}"
         sudo zfs snapshot -r "${SNAPSHOT_ID}"
         
         # --- 3. PRE-DELETION LOGIC (PRE_DELETE) ---
@@ -719,6 +744,8 @@ case "$BACKUP_MODE" in
                 # Remove if/else structure to allow set -e to work properly
                 # If this command fails, the trap will be triggered immediately
                 echo "  Using dynamic chunk size: $DYNAMIC_CHUNK_SIZE"
+                # Set operation context for error handling
+                export CURRENT_OPERATION="uploading incremental backup for dataset $dataset (${DATASET_ARQUIVO})"
                 sudo zfs send -Rwv "${dataset}@${SNAPSHOT_NOME}" | \
                     sudo "${RCLONE_BIN}" rcat --s3-chunk-size="$DYNAMIC_CHUNK_SIZE" "${S3_REMOTE}":"${S3_BUCKET_PATH}"/"${DATASET_ARQUIVO}"
                 
@@ -746,6 +773,8 @@ case "$BACKUP_MODE" in
         
         # --- 6. Local Cleanup ---
         echo "--- 6. Destroying Temporary Local Snapshot ---"
+        # Set operation context for error handling
+        export CURRENT_OPERATION="destroying temporary local snapshot ${SNAPSHOT_ID}"
         sudo zfs destroy -r "${SNAPSHOT_ID}"
         ;;
 esac
