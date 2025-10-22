@@ -9,7 +9,6 @@ A Bash script with advanced filters to backup ZFS raw snapshots to S3 using rclo
 - **Automatic Retention**: Configurable backup retention policies
 - **Error Handling**: Comprehensive error handling with optional Telegram notifications
 - **Security**: Configuration separated in `.env` file with secure permissions
-- **Compression**: Built-in zstd compression for efficient storage
 
 ## Quick Setup
 
@@ -63,12 +62,12 @@ All settings are configured in the `.env` file. Key parameters:
 ### FULL Mode
 - Backs up entire pool as single file
 - No filtering supported
-- File format: `zfs_backup_full_<pool>_<timestamp>.zst`
+- File format: `full_<pool>_<timestamp>`
 
 ### SPLIT Mode
 - Backs up each dataset individually
 - Supports all filtering options
-- File format: `zfs_backup_split_<dataset>_<timestamp>.zst`
+- File format: `split_<dataset>_<timestamp>`
 
 ## Filtering Examples
 

@@ -92,7 +92,6 @@
 # HOW IT WORKS:
 # --------------
 # - The script creates recursive snapshots of the pool/datasets
-# - Compresses data with zstd during sending
 # - Uploads to S3 using rclone
 # - Manages automatic retention of old backups
 # - Sends Telegram notifications on error
@@ -100,8 +99,8 @@
 #
 # GENERATED FILES:
 # -----------------
-# FULL mode : zfs_backup_full_<pool>_<timestamp>.zst
-# SPLIT mode: zfs_backup_split_<dataset>_<timestamp>.zst
+# FULL mode : full_<pool>_<timestamp>
+# SPLIT mode: split_<dataset>_<timestamp>
 #
 # ===================================================================
 
@@ -173,11 +172,11 @@ SNAPSHOT_NOME="$(date +%Y%m%d_%H%M%S)"
 SNAPSHOT_ID="${ZPOOL_ORIGEM}@${SNAPSHOT_NOME}"
 
 # File naming patterns (will be used based on BACKUP_MODE)
-S3_OBJECT_PREFIX_FULL="zfs_backup_full_$ZPOOL_FILE_FORMAT"
-S3_OBJECT_PREFIX_SPLIT="zfs_backup_split"
+S3_OBJECT_PREFIX_FULL="full_$ZPOOL_FILE_FORMAT"
+S3_OBJECT_PREFIX_SPLIT="split"
 
 # FULL mode filename
-ARQUIVO_ATUAL_FULL="${S3_OBJECT_PREFIX_FULL}_${SNAPSHOT_NOME}.zst"
+ARQUIVO_ATUAL_FULL="${S3_OBJECT_PREFIX_FULL}_${SNAPSHOT_NOME}"
 
 # ===================================================================
 # SCRIPT FUNCTIONS
@@ -244,6 +243,162 @@ set -eo pipefail
 
 # Uncomment the line below to test if the error trap is working
 # false
+
+# --- DYNAMIC CHUNK SIZE CALCULATION ---
+# Calculate optimal chunk size based on snapshot size
+# Arguments: $1 = snapshot name (e.g., "pool/dataset@snapshot" or "pool@snapshot")
+calculate_chunk_size() {
+    local snapshot_name="$1"
+    
+    echo "Calculating optimal chunk size for snapshot: $snapshot_name"
+    
+    # Get estimated size using zfs send -nv (dry run with verbose)
+    # For recursive sends, we need the TOTAL estimated size (last line)
+    echo "DEBUG: Running zfs send -Rnv command..."
+    local full_output size_output
+    
+    # Run the command and capture both output and exit code
+    # Always use RAW flag for encrypted datasets
+    if ! full_output=$(sudo zfs send -Rnvw "$snapshot_name" 2>&1); then
+        echo "ERROR: zfs send -Rnvw command failed for snapshot: $snapshot_name"
+        echo "Command output: $full_output"
+        export DYNAMIC_CHUNK_SIZE="5Mi"
+        return 1  # This will trigger the trap
+    fi
+    
+    echo "DEBUG: ZFS command with RAW completed successfully"
+    
+    # First try to get "total estimated size is" (for recursive sends)
+    size_output=$(echo "$full_output" | grep "total estimated size is" | tail -1)
+    
+    # If not found, try "estimated size is" (for single dataset sends)
+    if [ -z "$size_output" ]; then
+        size_output=$(echo "$full_output" | grep "estimated size is" | tail -1)
+    fi
+    
+    if [ -z "$size_output" ]; then
+        echo "Warning: Could not estimate snapshot size. Using default chunk size (5Mi)."
+        echo "Debug - ZFS output:"
+        echo "$full_output"
+        export DYNAMIC_CHUNK_SIZE="5Mi"
+        echo ""
+        return 0
+    fi
+    
+    echo "ZFS size estimation: $size_output"
+    
+    # Extract size and unit from output (e.g., "total estimated size is 81.5G")
+    echo "DEBUG: Parsing size and unit from output..."
+    local size_value unit
+    size_value=$(echo "$size_output" | grep -oE '[0-9]+(\.[0-9]+)?' | tail -1)
+    unit=$(echo "$size_output" | grep -oE '[KMGT]B?' | tail -1)
+    
+    echo "DEBUG: size_value='$size_value', unit='$unit'"
+    
+    if [ -z "$size_value" ] || [ -z "$unit" ]; then
+        echo "Warning: Could not parse snapshot size. Using default chunk size (5Mi)."
+        echo "DEBUG: Parsing failed - size_value='$size_value', unit='$unit'"
+        export DYNAMIC_CHUNK_SIZE="5Mi"
+        echo ""
+        return 0
+    fi
+    
+    echo "Estimated snapshot size: ${size_value}${unit}"
+    
+    # Convert to bytes for calculation (with simple decimal handling)
+    echo "DEBUG: Converting to bytes..."
+    local size_bytes=0
+    
+    # Handle decimal values by multiplying by 10 and working in "tenths"
+    local size_tenths
+    if echo "$size_value" | grep -q '\.'; then
+        # Has decimal: convert "5.7" to "57" (tenths)
+        size_tenths=$(echo "$size_value" | sed 's/\.//')
+        echo "DEBUG: Has decimal - size_tenths='$size_tenths'"
+    else
+        # No decimal: convert "5" to "50" (tenths)
+        size_tenths="${size_value}0"
+        echo "DEBUG: No decimal - size_tenths='$size_tenths'"
+    fi
+    
+    echo "DEBUG: Starting byte conversion with unit='$unit', size_tenths='$size_tenths'"
+    
+    case "$unit" in
+        "B"|"") 
+            size_bytes=$((size_tenths / 10))
+            echo "DEBUG: Bytes calculation: $size_tenths / 10 = $size_bytes"
+            ;;
+        "K"|"KB") 
+            size_bytes=$((size_tenths * 1024 / 10))
+            echo "DEBUG: KB calculation: $size_tenths * 1024 / 10 = $size_bytes"
+            ;;
+        "M"|"MB") 
+            size_bytes=$((size_tenths * 1048576 / 10))
+            echo "DEBUG: MB calculation: $size_tenths * 1048576 / 10 = $size_bytes"
+            ;;
+        "G"|"GB") 
+            size_bytes=$((size_tenths * 1073741824 / 10))
+            echo "DEBUG: GB calculation: $size_tenths * 1073741824 / 10 = $size_bytes"
+            ;;
+        "T"|"TB") 
+            size_bytes=$((size_tenths * 1099511627776 / 10))
+            echo "DEBUG: TB calculation: $size_tenths * 1099511627776 / 10 = $size_bytes"
+            ;;
+        *) 
+            echo "Warning: Unknown unit '$unit'. Using default chunk size (5Mi)."
+            export DYNAMIC_CHUNK_SIZE="5Mi"
+            echo ""
+            return 0
+            ;;
+    esac
+    
+    echo "DEBUG: Byte conversion completed: $size_bytes bytes"
+    echo "Parsed values: original=$size_value$unit, tenths=$size_tenths, unit=$unit"
+    echo "Calculated total size: $size_bytes bytes"
+    
+    # Calculate optimal chunk size
+    # S3 multipart upload limit: 10,000 parts
+    # We use 9,000 as safety margin
+    # Minimum: 5Mi (5242880 bytes)
+    # Maximum: 5Gi (5368709120 bytes)
+    
+    local min_chunk=5242880      # 5Mi
+    local max_chunk=5368709120   # 5Gi
+    local calculated_chunk
+    
+    if [ "$size_bytes" -le 0 ]; then
+        calculated_chunk=$min_chunk
+    else
+        calculated_chunk=$((size_bytes / 9000))
+        
+        # Apply limits
+        if [ "$calculated_chunk" -lt "$min_chunk" ]; then
+            calculated_chunk=$min_chunk
+        elif [ "$calculated_chunk" -gt "$max_chunk" ]; then
+            calculated_chunk=$max_chunk
+        fi
+    fi
+    
+    # Convert to Mi for rclone parameter
+    local chunk_mi=$((calculated_chunk / 1024 / 1024))
+    
+    # Ensure minimum of 5Mi
+    if [ "$chunk_mi" -lt 5 ]; then
+        chunk_mi=5
+    fi
+    
+    local estimated_parts=$((size_bytes / calculated_chunk))
+    
+    echo "Chunk calculation details:"
+    echo "  - Raw calculated chunk: $calculated_chunk bytes"
+    echo "  - Final chunk size: ${chunk_mi}Mi"
+    echo "  - Estimated multipart parts: $estimated_parts"
+    echo "  - S3 limit compliance: $([ $estimated_parts -lt 10000 ] && echo "✅ OK" || echo "⚠️  WARNING: May exceed 10,000 parts limit")"
+    
+    # Export for use in rclone commands
+    export DYNAMIC_CHUNK_SIZE="${chunk_mi}Mi"
+    echo ""
+}
 
 # --- DATASET FILTERING FUNCTIONS ---
 # Gets list of first-level datasets from pool
@@ -312,12 +467,12 @@ aplicar_politica_retencao() {
     # 1. List all existing backups in S3 based on backup mode
     local BACKUP_PATTERN
     if [[ "$BACKUP_MODE" == "FULL" ]]; then
-        BACKUP_PATTERN="zfs_backup_full_${ZPOOL_FILE_FORMAT}_"
+        BACKUP_PATTERN="full_${ZPOOL_FILE_FORMAT}_"
         echo "Looking for FULL backups with pattern: $BACKUP_PATTERN"
     else
         if [ -n "$DATASET_PATTERN" ]; then
             # For SPLIT mode with specific dataset
-            BACKUP_PATTERN="zfs_backup_split_${DATASET_PATTERN}_"
+            BACKUP_PATTERN="split_${DATASET_PATTERN}_"
             echo "Looking for SPLIT backups of dataset '$DATASET_PATTERN' with pattern: $BACKUP_PATTERN"
         else
             # This shouldn't happen in normal operation
@@ -486,13 +641,16 @@ case "$BACKUP_MODE" in
         fi
 
         # --- 3. SENDING NEW FULL ---
-        echo "--- 3. Sending New Full (RAW + ZSTD) to S3 ---"
+        echo "--- 3. Sending New Full (RAW) to S3 ---"
+        
+        # Calculate optimal chunk size for this snapshot
+        calculate_chunk_size "${SNAPSHOT_ID}"
         
         # Complete pool backup (FULL mode always uses FILTER_TYPE="NONE")
         # If this fails, the trap will handle the error automatically
+        echo "Using dynamic chunk size: $DYNAMIC_CHUNK_SIZE"
         sudo zfs send -Rwv "${SNAPSHOT_ID}" | \
-            sudo zstd | \
-            sudo "${RCLONE_BIN}" rcat "${S3_REMOTE}":"${S3_BUCKET_PATH}"/"${ARQUIVO_ATUAL_FULL}"
+            sudo "${RCLONE_BIN}" rcat --s3-chunk-size="$DYNAMIC_CHUNK_SIZE" "${S3_REMOTE}":"${S3_BUCKET_PATH}"/"${ARQUIVO_ATUAL_FULL}"
 
         echo "✓ Full backup sent successfully"
 
@@ -551,15 +709,18 @@ case "$BACKUP_MODE" in
             if [ -n "$dataset" ]; then
                 echo "Processing dataset: $dataset"
                 DATASET_SAFE_NAME=$(echo "$dataset" | sed -e 's/\//_/g')
-                DATASET_ARQUIVO="zfs_backup_split_${DATASET_SAFE_NAME}_${SNAPSHOT_NOME}.zst"
+                DATASET_ARQUIVO="split_${DATASET_SAFE_NAME}_${SNAPSHOT_NOME}"
                 
                 echo "  Sending $dataset as $DATASET_ARQUIVO"
                 
+                # Calculate optimal chunk size for this specific dataset
+                calculate_chunk_size "${dataset}@${SNAPSHOT_NOME}"
+                
                 # Remove if/else structure to allow set -e to work properly
                 # If this command fails, the trap will be triggered immediately
+                echo "  Using dynamic chunk size: $DYNAMIC_CHUNK_SIZE"
                 sudo zfs send -Rwv "${dataset}@${SNAPSHOT_NOME}" | \
-                    sudo zstd | \
-                    sudo "${RCLONE_BIN}" rcat "${S3_REMOTE}":"${S3_BUCKET_PATH}"/"${DATASET_ARQUIVO}"
+                    sudo "${RCLONE_BIN}" rcat --s3-chunk-size="$DYNAMIC_CHUNK_SIZE" "${S3_REMOTE}":"${S3_BUCKET_PATH}"/"${DATASET_ARQUIVO}"
                 
                 echo "  ✓ Dataset $dataset sent successfully"
                 BACKUP_COUNT=$((BACKUP_COUNT + 1))
