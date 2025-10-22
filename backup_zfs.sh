@@ -745,7 +745,7 @@ case "$BACKUP_MODE" in
                 # If this command fails, the trap will be triggered immediately
                 echo "  Using dynamic chunk size: $DYNAMIC_CHUNK_SIZE"
                 # Set operation context for error handling
-                export CURRENT_OPERATION="uploading incremental backup for dataset $dataset (${DATASET_ARQUIVO})"
+                export CURRENT_OPERATION="uploading backup for dataset $dataset (${DATASET_ARQUIVO})"
                 sudo zfs send -Rwv "${dataset}@${SNAPSHOT_NOME}" | \
                     sudo "${RCLONE_BIN}" rcat --s3-chunk-size="$DYNAMIC_CHUNK_SIZE" "${S3_REMOTE}":"${S3_BUCKET_PATH}"/"${DATASET_ARQUIVO}"
                 
