@@ -211,12 +211,16 @@ send_telegram_alert() {
 # --- FUNCTION: ERROR TRAP (Executed AFTER script fails) ---
 # This function is called if the script exits with an error status (any command fails)
 handle_error() {
-    echo $?
     local EXIT_CODE=$?
+    local LINHA_ERRO=$1
+    
+    echo "DEBUG: handle_error called with EXIT_CODE=$EXIT_CODE, LINE=$LINHA_ERRO"
+    
     # Check if the error is not error 1 (grep) or 0 (success)
     if [ "$EXIT_CODE" -ne 0 ]; then
-        local LINHA_ERRO=$1
         local MENSAGEM_ERRO="Script failed at line $LINHA_ERRO. EXIT STATUS: $EXIT_CODE."
+        
+        echo "ERROR DETECTED: $MENSAGEM_ERRO"
 
         # Try to destroy pending local snapshot to free the pool
         echo "RECOVERY ACTION: Trying to destroy pending local snapshot..."
@@ -225,6 +229,9 @@ handle_error() {
 
         # Send notification
         send_telegram_alert "$MENSAGEM_ERRO"
+        
+        # Exit with the original error code
+        exit $EXIT_CODE
     fi
 }
 
@@ -234,6 +241,9 @@ trap 'handle_error $LINENO' ERR
 
 # Reactivate strict mode after configuring trap
 set -eo pipefail
+
+# Uncomment the line below to test if the error trap is working
+# false
 
 # --- DATASET FILTERING FUNCTIONS ---
 # Gets list of first-level datasets from pool
@@ -479,14 +489,12 @@ case "$BACKUP_MODE" in
         echo "--- 3. Sending New Full (RAW + ZSTD) to S3 ---"
         
         # Complete pool backup (FULL mode always uses FILTER_TYPE="NONE")
+        # If this fails, the trap will handle the error automatically
         sudo zfs send -Rwv "${SNAPSHOT_ID}" | \
             sudo zstd | \
             sudo "${RCLONE_BIN}" rcat "${S3_REMOTE}":"${S3_BUCKET_PATH}"/"${ARQUIVO_ATUAL_FULL}"
 
-        if [ $? -ne 0 ]; then
-            echo "CRITICAL ERROR: Sending failed. Local snapshot '$SNAPSHOT_ID' must be destroyed manually."
-            exit 1
-        fi
+        echo "✓ Full backup sent successfully"
 
         # --- 4. POST-DELETION LOGIC (POST_DELETE) ---
         if [[ "$DELETION_MODE" == "POST_DELETE" ]]; then
@@ -538,7 +546,6 @@ case "$BACKUP_MODE" in
         # --- 4. SENDING INDIVIDUAL DATASETS ---
         echo "--- 4. Sending individual datasets to S3 ---"
         BACKUP_COUNT=0
-        FAILED_DATASETS=""
         
         while IFS= read -r dataset; do
             if [ -n "$dataset" ]; then
@@ -548,25 +555,18 @@ case "$BACKUP_MODE" in
                 
                 echo "  Sending $dataset as $DATASET_ARQUIVO"
                 
-                if sudo zfs send -Rwv "${dataset}@${SNAPSHOT_NOME}" | \
-                   sudo zstd | \
-                   sudo "${RCLONE_BIN}" rcat "${S3_REMOTE}":"${S3_BUCKET_PATH}"/"${DATASET_ARQUIVO}"; then
-                    echo "  ✓ Dataset $dataset sent successfully"
-                    BACKUP_COUNT=$((BACKUP_COUNT + 1))
-                else
-                    echo "  ✗ ERROR sending dataset $dataset"
-                    FAILED_DATASETS="$FAILED_DATASETS\n  - $dataset"
-                fi
+                # Remove if/else structure to allow set -e to work properly
+                # If this command fails, the trap will be triggered immediately
+                sudo zfs send -Rwv "${dataset}@${SNAPSHOT_NOME}" | \
+                    sudo zstd | \
+                    sudo "${RCLONE_BIN}" rcat "${S3_REMOTE}":"${S3_BUCKET_PATH}"/"${DATASET_ARQUIVO}"
+                
+                echo "  ✓ Dataset $dataset sent successfully"
+                BACKUP_COUNT=$((BACKUP_COUNT + 1))
             fi
         done <<< "$DATASETS_FILTERED"
         
         echo "Summary: $BACKUP_COUNT dataset(s) sent successfully"
-        
-        if [ -n "$FAILED_DATASETS" ]; then
-            echo "ERROR: Some datasets failed:"
-            echo -e "$FAILED_DATASETS"
-            # Don't exit here to allow cleanup
-        fi
         
         # --- 5. POST-DELETION LOGIC (POST_DELETE) ---
         if [[ "$DELETION_MODE" == "POST_DELETE" ]]; then
@@ -586,12 +586,6 @@ case "$BACKUP_MODE" in
         # --- 6. Local Cleanup ---
         echo "--- 6. Destroying Temporary Local Snapshot ---"
         sudo zfs destroy -r "${SNAPSHOT_ID}"
-        
-        # Check if there were failures
-        if [ -n "$FAILED_DATASETS" ]; then
-            echo "WARNING: Backup completed with failures in some datasets."
-            exit 1
-        fi
         ;;
 esac
 
