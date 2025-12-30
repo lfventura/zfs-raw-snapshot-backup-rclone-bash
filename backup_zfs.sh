@@ -363,7 +363,7 @@ calculate_chunk_size() {
     
     # Calculate optimal chunk size
     # S3 multipart upload limit: 10,000 parts
-    # We use 9,000 as safety margin
+    # We use 8,000 as safety margin
     # Minimum: 5Mi (5242880 bytes)
     # Maximum: 5Gi (5368709120 bytes)
     
@@ -374,11 +374,7 @@ calculate_chunk_size() {
     if [ "$size_bytes" -le 0 ]; then
         calculated_chunk=$min_chunk
     else
-        calculated_chunk=$((size_bytes / 9000))
-        # If the division has decimal, adds +1
-        if [ $(( size_bytes % 9000 )) -gt 0 ]; then
-          ((calculated_chunk++))
-        fi
+        calculated_chunk=$((size_bytes / 8000))
         
         # Apply limits
         if [ "$calculated_chunk" -lt "$min_chunk" ]; then
