@@ -375,6 +375,10 @@ calculate_chunk_size() {
         calculated_chunk=$min_chunk
     else
         calculated_chunk=$((size_bytes / 9000))
+        # If the division has decimal, adds +1
+        if [ $(( size_bytes % 9000 )) -gt 0 ]; then
+          ((calculated_chunk++))
+        fi
         
         # Apply limits
         if [ "$calculated_chunk" -lt "$min_chunk" ]; then
